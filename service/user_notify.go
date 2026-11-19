@@ -12,6 +12,20 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 )
 
+// quotaReminderDue reports the first charge that crosses the effective
+// low-balance threshold. A user's explicit switch overrides the site default.
+func quotaReminderDue(userSetting dto.UserSetting, previousBalance, currentBalance int64) bool {
+	enabled := common.QuotaRemindEnabled
+	threshold := int64(common.QuotaRemindThreshold)
+	if userSetting.QuotaWarningEnabled != nil {
+		enabled = *userSetting.QuotaWarningEnabled
+	}
+	if userSetting.QuotaWarningThreshold > 0 {
+		threshold = int64(userSetting.QuotaWarningThreshold)
+	}
+	return enabled && threshold > 0 && previousBalance >= threshold && currentBalance < threshold
+}
+
 func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data dto.Notify) error {
 	notifyType := userSetting.NotifyType
 	if notifyType == "" {
