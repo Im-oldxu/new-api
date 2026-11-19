@@ -8,61 +8,22 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 )
 
-// NotifyChannelWatchers sends a channel notice (a channel disabled or enabled
-// automatically, or a test of all channels finished) to every administrator
-// who receives channel notices. Until they choose, the root user receives them
-// and other administrators do not. render builds the subject and content in
-// the recipient's saved language; an empty language means DEFAULT_LANGUAGE.
-func NotifyChannelWatchers(notifyType string, render func(lang string) (subject string, content string)) {
-	notifyAdmins(notifyType, func(role int, setting dto.UserSetting) bool {
-		if setting.ChannelNotifyEnabled != nil {
-			return *setting.ChannelNotifyEnabled
-		}
-		return role == common.RoleRootUser
-	}, render)
-}
-
-// NotifyUpstreamModelUpdateWatchers sends the upstream model update notice to
-// every administrator who enabled it. render builds the subject and content in
-// the recipient's saved language; an empty language means DEFAULT_LANGUAGE.
-func NotifyUpstreamModelUpdateWatchers(render func(lang string) (subject string, content string)) {
-	sentCount := notifyAdmins(dto.NotifyTypeChannelUpdate, func(_ int, setting dto.UserSetting) bool {
-		return setting.UpstreamModelUpdateNotifyEnabled
-	}, render)
-	common.SysLog(common.LogText("upstream model update notifications sent: %d", sentCount))
-}
-
-// notifyAdmins sends a notice to each enabled administrator for whom receives
-// returns true, and returns how many notices it sent.
-func notifyAdmins(notifyType string, receives func(role int, setting dto.UserSetting) bool, render func(lang string) (subject string, content string)) int {
-	var users []model.User
-	if err := model.DB.
-		Select("id", "email", "role", "status", "setting").
-		Where("status = ? AND role >= ?", common.UserStatusEnabled, common.RoleAdminUser).
-		Find(&users).Error; err != nil {
-		common.SysLog(common.LogText("failed to query administrators to notify: %s", err.Error()))
-		return 0
+// quotaReminderDue reports the first charge that crosses the effective
+// low-balance threshold. A user's explicit switch overrides the site default.
+func quotaReminderDue(userSetting dto.UserSetting, previousBalance, currentBalance int64) bool {
+	enabled := common.QuotaRemindEnabled
+	threshold := int64(common.QuotaRemindThreshold)
+	if userSetting.QuotaWarningEnabled != nil {
+		enabled = *userSetting.QuotaWarningEnabled
 	}
-
-	sentCount := 0
-	for _, user := range users {
-		userSetting := user.GetSetting()
-		if !receives(user.Role, userSetting) {
-			continue
-		}
-		subject, content := render(userSetting.Language)
-		if err := NotifyUser(user.Id, user.Email, userSetting, dto.NewNotify(notifyType, subject, content, nil)); err != nil {
-			common.SysLog(common.LogText("failed to send notice %s to user %d: %s", notifyType, user.Id, err.Error()))
-			continue
-		}
-		sentCount++
+	if userSetting.QuotaWarningThreshold > 0 {
+		threshold = int64(userSetting.QuotaWarningThreshold)
 	}
-	return sentCount
+	return enabled && threshold > 0 && previousBalance >= threshold && currentBalance < threshold
 }
 
 func NotifyUser(userId int, userEmail string, userSetting dto.UserSetting, data dto.Notify) error {

@@ -221,7 +221,6 @@ func InitDB() (err error) {
 			return nil
 		}
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
 		}
 		common.SysLog(common.LogText("database migration started"))
 		err = migrateDB()
@@ -339,8 +338,11 @@ func migrateDB() error {
 		common.SysError(common.LogText("failed to migrate options primary key: %s", err.Error()))
 	}
 
+	if err := archiveLegacyGatewayTables(DB); err != nil {
+		return err
+	}
+
 	err := DB.AutoMigrate(
-		&Channel{},
 		&Token{},
 		&User{},
 		&UserSession{},
@@ -350,12 +352,9 @@ func migrateDB() error {
 		&Option{},
 		&LoginEncryptionKey{},
 		&Redemption{},
-		&Ability{},
 		&Log{},
 		&TopUp{},
 		&QuotaData{},
-		&Model{},
-		&Vendor{},
 		&PrefillGroup{},
 		&Setup{},
 		&TwoFA{},
