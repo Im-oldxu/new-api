@@ -14,7 +14,6 @@ import (
 // topic applies the task by reloading the topic.
 const (
 	SyncTopicOptions           = "options"
-	SyncTopicChannels          = "channels"
 	SyncTopicAuthz             = "authz"
 	SyncTopicPlugins           = "plugins"
 	SyncTopicOAuthProviders    = "oauth_providers"

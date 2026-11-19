@@ -281,9 +281,6 @@ func UpdateOption(key string, value string) error {
 		_, err := UpdatePasskeyDomainOptions(map[string]string{key: value}, false, "")
 		return err
 	}
-	if IsModelPricingOption(key) {
-		return UpdateModelPricingOptions(map[string]string{key: value})
-	}
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}

@@ -130,46 +130,9 @@ func fillFlowTokenNames(rows []*FlowQuotaData) error {
 }
 
 func fillFlowChannelNames(rows []*FlowQuotaData) error {
-	channelIDSet := make(map[int]struct{})
-	channelIDs := make([]int, 0)
+	// Channel records are archived when the gateway runtime is removed.
+	// Keep historical usage rows readable without querying a retired table.
 	for _, row := range rows {
-		if row.ChannelID == 0 {
-			continue
-		}
-		if _, ok := channelIDSet[row.ChannelID]; ok {
-			continue
-		}
-		channelIDSet[row.ChannelID] = struct{}{}
-		channelIDs = append(channelIDs, row.ChannelID)
-	}
-	if len(channelIDs) == 0 {
-		return nil
-	}
-
-	channelNameByID := make(map[int]string, len(channelIDs))
-	if common.MemoryCacheEnabled {
-		for _, channelID := range channelIDs {
-			if channel, err := CacheGetChannel(channelID); err == nil {
-				channelNameByID[channelID] = channel.Name
-			}
-		}
-	} else {
-		var channels []struct {
-			Id   int    `gorm:"column:id"`
-			Name string `gorm:"column:name"`
-		}
-		if err := DB.Table("channels").Select("id, name").Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
-			return err
-		}
-		for _, channel := range channels {
-			channelNameByID[channel.Id] = channel.Name
-		}
-	}
-	for _, row := range rows {
-		if name := channelNameByID[row.ChannelID]; name != "" {
-			row.ChannelName = name
-			continue
-		}
 		if row.ChannelID > 0 {
 			row.ChannelName = fmt.Sprintf("channel-%d", row.ChannelID)
 		}
