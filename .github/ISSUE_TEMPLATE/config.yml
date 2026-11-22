@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安装与配置 / Installation and configuration
+    url: https://github.com/Im-oldxu/new-api#readme
+    about: 查看管理后台模板的 README、部署和复用说明。

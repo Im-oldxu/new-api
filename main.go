@@ -1,0 +1,302 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"embed"
+	"errors"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/Im-oldxu/new-api/common"
+	"github.com/Im-oldxu/new-api/controller"
+	"github.com/Im-oldxu/new-api/i18n"
+	"github.com/Im-oldxu/new-api/logger"
+	"github.com/Im-oldxu/new-api/middleware"
+	"github.com/Im-oldxu/new-api/model"
+	"github.com/Im-oldxu/new-api/oauth"
+	"github.com/Im-oldxu/new-api/router"
+	"github.com/Im-oldxu/new-api/service"
+	"github.com/Im-oldxu/new-api/service/authz"
+	_ "github.com/Im-oldxu/new-api/setting/performance_setting"
+
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+
+	_ "net/http/pprof"
+)
+
+//go:embed web/dist
+var buildFS embed.FS
+
+//go:embed web/dist/index.html
+var indexPage []byte
+
+var businessModules []router.BusinessModule
+
+func main() {
+	startTime := time.Now()
+
+	err := InitResources()
+	if err != nil {
+		common.FatalLog(common.LogText("failed to initialize resources: %s", err.Error()))
+		return
+	}
+	defer logger.CloseLogger()
+
+	common.SysLog(common.LogText("New API %s started", common.Version))
+	if os.Getenv("GIN_MODE") != "debug" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	if common.DebugEnabled {
+		common.SysLog(common.LogText("running in debug mode"))
+	}
+
+	defer func() {
+		err := model.CloseDB()
+		if err != nil {
+			common.FatalLog(common.LogText("failed to close database: %s", err.Error()))
+		}
+	}()
+
+	if common.RedisEnabled {
+		// for compatibility with old versions
+		common.MemoryCacheEnabled = true
+	}
+
+	// Every node reloads a topic within seconds of a write to it on any node.
+	// The periodic reloads below stay for writes that do not bump a topic.
+	service.RegisterSyncTopic(model.SyncTopicOptions, func(context.Context) error { return model.LoadOptionsFromDatabase() })
+	service.RegisterSyncTopic(model.SyncTopicAuthz, func(context.Context) error { return authz.ReloadPolicy() })
+	service.RegisterSyncTopic(model.SyncTopicOAuthProviders, func(context.Context) error { return oauth.LoadCustomProviders() })
+	service.StartNodeSync()
+
+	// 热更新配置
+	go model.SyncOptions(common.SyncFrequency)
+
+	// 周期性重载授权策略，保证多节点/多 master 部署下权限变更能传播到每个实例
+	go authz.StartPolicySync(common.SyncFrequency)
+
+	// Report this process as a system instance so the System Info page can show
+	// all currently alive nodes in multi-instance deployments.
+	service.StartSystemInstanceReporter()
+
+	controller.RegisterSystemTaskHandlers()
+	service.StartSystemTaskRunner()
+
+	host := os.Getenv("HOST")
+	if os.Getenv("ENABLE_PPROF") == "true" {
+		gopool.Go(func() {
+			log.Println(http.ListenAndServe(net.JoinHostPort(host, "8005"), nil))
+		})
+		go common.Monitor()
+		common.SysLog(common.LogText("pprof enabled"))
+	}
+
+	err = common.StartPyroScope()
+	if err != nil {
+		common.SysError(common.LogText("start pyroscope error : %v", err))
+	}
+
+	// Initialize HTTP server
+	server := gin.New()
+	if err := middleware.ConfigureTrustedProxies(server); err != nil {
+		common.FatalLog(common.LogText("failed to configure trusted proxies: %s", err.Error()))
+		return
+	}
+	server.Use(middleware.PanicRecover())
+	// This will cause SSE not to work!!!
+	//server.Use(gzip.Gzip(gzip.DefaultCompression))
+	server.Use(middleware.RequestId())
+	server.Use(middleware.Version())
+	server.Use(middleware.I18n())
+	middleware.SetUpLogger(server)
+	InjectUmamiAnalytics()
+	InjectGoogleAnalytics()
+
+	// 设置路由
+	router.SetRouter(server, router.WebAssets{
+		BuildFS:   buildFS,
+		IndexPage: indexPage,
+	}, businessModules...)
+	var port = os.Getenv("PORT")
+	if port == "" {
+		port = strconv.Itoa(*common.Port)
+	}
+
+	srv := &http.Server{
+		Addr:    net.JoinHostPort(host, port),
+		Handler: server,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			common.FatalLog(common.LogText("failed to start HTTP server: %s", err.Error()))
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	common.LogStartupSuccess(startTime, host, port)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	common.SysLog(common.LogText("received signal: %v, shutting down...", sig))
+
+	// SSE streams may run for minutes; give them time to finish before forced exit
+	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		common.SysError(common.LogText("server forced to shutdown: %v", err))
+	}
+	common.SysLog(common.LogText("server exited"))
+}
+
+func InjectUmamiAnalytics() {
+	analyticsInjectBuilder := &strings.Builder{}
+	if os.Getenv("UMAMI_WEBSITE_ID") != "" {
+		umamiSiteID := os.Getenv("UMAMI_WEBSITE_ID")
+		umamiScriptURL := os.Getenv("UMAMI_SCRIPT_URL")
+		if umamiScriptURL == "" {
+			umamiScriptURL = "https://analytics.umami.is/script.js"
+		}
+		analyticsInjectBuilder.WriteString("<script defer src=\"")
+		analyticsInjectBuilder.WriteString(umamiScriptURL)
+		analyticsInjectBuilder.WriteString("\" data-website-id=\"")
+		analyticsInjectBuilder.WriteString(umamiSiteID)
+		analyticsInjectBuilder.WriteString("\"></script>")
+	}
+	analyticsInjectBuilder.WriteString("<!--Umami QuantumNous-->\n")
+	analyticsInject := []byte(analyticsInjectBuilder.String())
+	placeholder := []byte("<!--umami-->\n")
+	indexPage = bytes.ReplaceAll(indexPage, placeholder, analyticsInject)
+}
+
+func InjectGoogleAnalytics() {
+	analyticsInjectBuilder := &strings.Builder{}
+	if os.Getenv("GOOGLE_ANALYTICS_ID") != "" {
+		gaID := os.Getenv("GOOGLE_ANALYTICS_ID")
+		// Google Analytics 4 (gtag.js)
+		analyticsInjectBuilder.WriteString("<script async src=\"https://www.googletagmanager.com/gtag/js?id=")
+		analyticsInjectBuilder.WriteString(gaID)
+		analyticsInjectBuilder.WriteString("\"></script>")
+		analyticsInjectBuilder.WriteString("<script>")
+		analyticsInjectBuilder.WriteString("window.dataLayer = window.dataLayer || [];")
+		analyticsInjectBuilder.WriteString("function gtag(){dataLayer.push(arguments);}")
+		analyticsInjectBuilder.WriteString("gtag('js', new Date());")
+		analyticsInjectBuilder.WriteString("gtag('config', '")
+		analyticsInjectBuilder.WriteString(gaID)
+		analyticsInjectBuilder.WriteString("');")
+		analyticsInjectBuilder.WriteString("</script>")
+	}
+	analyticsInjectBuilder.WriteString("<!--Google Analytics QuantumNous-->\n")
+	analyticsInject := []byte(analyticsInjectBuilder.String())
+	placeholder := []byte("<!--Google Analytics-->\n")
+	indexPage = bytes.ReplaceAll(indexPage, placeholder, analyticsInject)
+}
+
+func InitResources() error {
+	err := godotenv.Load(".env")
+	if err != nil {
+		if common.DebugEnabled {
+			common.SysLog(common.LogText("No .env file found, using default environment variables. If needed, please create a .env file and set the relevant variables."))
+		}
+	}
+
+	// 加载环境变量
+	common.InitEnv()
+
+	logger.SetupLogger()
+
+	// Initialize SQL Database
+	err = model.InitDB()
+	if err != nil {
+		common.FatalLog(common.LogText("failed to initialize database: %s", err.Error()))
+		return err
+	}
+	if common.IsMasterNode {
+		for _, module := range businessModules {
+			if err := module.Migrate(model.DB); err != nil {
+				return err
+			}
+		}
+	}
+	// Before the loads below: a write made while they run is reloaded later.
+	service.ReadStartupSyncRevisions()
+	if err = authz.Init(model.DB); err != nil {
+		common.FatalLog(common.LogText("failed to initialize authorization: %s", err.Error()))
+		return err
+	}
+	if common.IsMasterNode {
+		// The master rewrote the built-in role policies.
+		model.BumpSyncTopic(model.SyncTopicAuthz)
+	}
+	if common.PasswordLoginEncryptionEnabled {
+		if err = model.InitPasswordEncryption(); err != nil {
+			common.FatalLog(common.LogText("failed to initialize password encryption: %s", err.Error()))
+			return err
+		}
+	}
+
+	model.CheckSetup()
+
+	// Initialize options, should after model.InitDB()
+	if common.IsMasterNode {
+		if err := model.MigrateRetiredFrontendOptions(); err != nil {
+			common.SysError(common.LogText("failed to migrate retired frontend options: %s", err.Error()))
+		}
+	}
+	model.InitOptionMap()
+
+	// 清理旧的磁盘缓存文件
+	common.CleanupOldCacheFiles()
+
+	// Initialize SQL Database
+	err = model.InitLogDB()
+	if err != nil {
+		return err
+	}
+
+	// Initialize Redis
+	err = common.InitRedisClient()
+	if err != nil {
+		return err
+	}
+
+	// 启动系统监控
+	common.StartSystemMonitor()
+
+	// Initialize i18n
+	err = i18n.Init()
+	if err != nil {
+		common.SysError(common.LogText("failed to initialize i18n: %s", err.Error()))
+		// Don't return error, i18n is not critical
+	} else {
+		common.SysLog(common.LogText("i18n initialized with languages: %s", strings.Join(i18n.SupportedLanguages(), ", ")))
+	}
+	// Register user language loader for lazy loading
+	i18n.SetUserLangLoader(model.GetUserLanguage)
+
+	// Load custom OAuth providers from database
+	err = oauth.LoadCustomProviders()
+	if err != nil {
+		common.SysError(common.LogText("failed to load custom OAuth providers: %s", err.Error()))
+		// Don't return error, custom OAuth is not critical
+		// The node sync loads them again on its first tick.
+		service.SyncTopicLoadFailed(model.SyncTopicOAuthProviders, err)
+	}
+
+	service.StartAuthArtifactCleanup()
+
+	return nil
+}
